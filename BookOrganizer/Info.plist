@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD plist 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Application Information -->
+    <key>CFBundleDevelopmentRegion</key>
+    <string>$(DEVELOPMENT_LANGUAGE)</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.yourcompany.BookOrganizer</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+
+    <!-- Permissions -->
+    <key>NSDownloadsDirectoryUsageDescription</key>
+    <string>This app needs access to your Downloads folder to organize books.</string>
+    <key>NSNetworkUsageDescription</key>
+    <string>This app accesses the internet to fetch book information.</string>
+
+    <!-- App Transport Security Settings -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+
+    <!-- High Resolution Mode -->
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!-- Enable Agent Mode for Menu Bar App -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Enable Auto-Launch at Login -->
+    <key>SMPrivilegedExecutables</key>
+    <dict>
+        <key>com.yourcompany.BookOrganizerLauncher</key>
+        <string>$(AppIdentifierPrefix)com.yourcompany.BookOrganizerLauncher</string>
+    </dict>
+</dict>
+</plist>

@@ -4,6 +4,7 @@ import PDFKit
 import ZIPFoundation
 import AppKit
 
+@MainActor
 class FileMonitor: ObservableObject {
     @Published var detectedFiles: [DetectedFile] = []
 
@@ -11,8 +12,9 @@ class FileMonitor: ObservableObject {
     private let downloadsURL: URL
     private let booksFolderURL: URL
     private let allowedExtensions = ["pdf", "epub"]
-    private let operationQueue = OperationQueue()
-    private var folderMonitor: DispatchSourceFileSystemObject?
+    private var folderMonitor: DispatchSourceProtocol?
+    private var isProcessing = false
+    private var processingTasks: [URL: Task<Void, Never>] = [:]
 
     init() {
         downloadsURL = fileManager.urls(for: .downloadsDirectory, in: .userDomainMask).first!
@@ -21,22 +23,19 @@ class FileMonitor: ObservableObject {
         log("[Init] FileMonitor initialized")
         log("[Init] Downloads URL: \(downloadsURL.path)")
         log("[Init] Books Folder URL: \(booksFolderURL.path)")
-
-        // Configure the operation queue
-        operationQueue.maxConcurrentOperationCount = 4
-        operationQueue.qualityOfService = .userInitiated
     }
 
     func startMonitoring() {
         createBooksFolder()
-        processExistingFiles()
+        Task {
+            await processExistingFiles()
+        }
         startFolderMonitor()
     }
 
     func stopMonitoring() {
         folderMonitor?.cancel()
         folderMonitor = nil
-        operationQueue.cancelAllOperations()
         log("[Monitoring] Stopped monitoring.")
     }
 
@@ -47,10 +46,15 @@ class FileMonitor: ObservableObject {
             return
         }
 
-        folderMonitor = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.write, .extend], queue: DispatchQueue.global())
+        let eventMask: DispatchSource.FileSystemEvent = [.write, .extend]
+        let queue = DispatchQueue.global()
+
+        folderMonitor = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: eventMask, queue: queue)
 
         folderMonitor?.setEventHandler { [weak self] in
-            self?.directoryDidChange()
+            Task { [weak self] in
+                await self?.debouncedDirectoryDidChange()
+            }
         }
 
         folderMonitor?.setCancelHandler {
@@ -58,15 +62,26 @@ class FileMonitor: ObservableObject {
         }
 
         folderMonitor?.resume()
+
         log("[Monitoring] Started monitoring \(downloadsURL.path) using DispatchSource.")
     }
 
-    private func directoryDidChange() {
-        log("[Monitoring] Detected changes in Downloads directory.")
-        processNewFiles()
+    private var debounceTimer: Task<Void, Never>?
+
+    private func debouncedDirectoryDidChange() async {
+        debounceTimer?.cancel()
+        debounceTimer = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+            await directoryDidChange()
+        }
     }
 
-    private func processNewFiles() {
+    private func directoryDidChange() async {
+        log("[Monitoring] Detected changes in Downloads directory.")
+        await processNewFiles()
+    }
+
+    private func processNewFiles() async {
         do {
             let fileURLs = try fileManager.contentsOfDirectory(at: downloadsURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
             for fileURL in fileURLs {
@@ -74,13 +89,11 @@ class FileMonitor: ObservableObject {
                     continue
                 }
 
-                DispatchQueue.main.async {
-                    if !self.detectedFiles.contains(where: { $0.url == fileURL }) {
-                        let detectedFile = DetectedFile(url: fileURL)
-                        self.detectedFiles.append(detectedFile)
-                        self.updateFileStatus(for: detectedFile.id, status: .pending)
-                        self.processFile(at: fileURL)
-                    }
+                if !detectedFiles.contains(where: { $0.url == fileURL }) {
+                    let detectedFile = DetectedFile(url: fileURL)
+                    detectedFiles.append(detectedFile)
+                    await updateFileStatus(for: detectedFile.id, status: .pending)
+                    await processFile(at: fileURL)
                 }
             }
         } catch {
@@ -102,35 +115,21 @@ class FileMonitor: ObservableObject {
         }
     }
 
-    private func processExistingFiles() {
+    private func processExistingFiles() async {
         log("[ProcessExistingFiles] Scanning Downloads folder for existing files.")
-        do {
-            let fileURLs = try fileManager.contentsOfDirectory(at: downloadsURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-            for fileURL in fileURLs {
-                guard allowedExtensions.contains(fileURL.pathExtension.lowercased()) else {
-                    continue
-                }
-                DispatchQueue.main.async {
-                    if !self.detectedFiles.contains(where: { $0.url == fileURL }) {
-                        let detectedFile = DetectedFile(url: fileURL)
-                        self.detectedFiles.append(detectedFile)
-                        self.updateFileStatus(for: detectedFile.id, status: .pending)
-                        self.processFile(at: fileURL)
-                    }
-                }
-            }
-        } catch {
-            log("[Error] Failed to list contents of Downloads folder: \(error)")
-        }
+        await processNewFiles()
     }
 
-    private func processFile(at url: URL) {
-        operationQueue.addOperation {
-            self.processFileOperation(at: url)
+    private func processFile(at url: URL) async {
+        guard !processingTasks.keys.contains(url) else { return }
+
+        let task = Task {
+            await processFileOperation(at: url)
         }
+        processingTasks[url] = task
     }
 
-    private func processFileOperation(at url: URL) {
+    private func processFileOperation(at url: URL) async {
         log("[ProcessFile] Processing file: \(url.lastPathComponent)")
 
         guard !url.path.contains("/Books/") else {
@@ -138,50 +137,48 @@ class FileMonitor: ObservableObject {
             return
         }
 
-        self.updateFileStatus(for: url, status: .processing)
+        await updateFileStatus(for: url, status: .processing)
 
         do {
             var identifiers = [String: String]() // Key: Type, Value: Identifier
 
-            if let isbn = try self.extractISBN(from: url) {
+            if let isbn = try await extractISBN(from: url) {
                 log("[ProcessFile] ISBN extracted: \(isbn)")
                 identifiers["isbn"] = isbn
-            } else if let title = try self.extractTitle(from: url) {
+            } else if let title = try extractTitle(from: url) {
                 log("[ProcessFile] Title extracted: \(title)")
                 identifiers["title"] = title
             } else {
                 log("[ProcessFile] No identifiers found in \(url.lastPathComponent).")
-                self.updateFileStatus(for: url, status: .failed)
+                await updateFileStatus(for: url, status: .failed)
                 return
             }
 
-            self.moveAndRenameFile(at: url, withIdentifiers: identifiers) { success in
-                if success {
-                    self.updateFileStatus(for: url, status: .processed)
-                } else {
-                    self.updateFileStatus(for: url, status: .failed)
-                }
+            let success = await moveAndRenameFile(at: url, withIdentifiers: identifiers)
+            if success {
+                await updateFileStatus(for: url, status: .processed)
+            } else {
+                await updateFileStatus(for: url, status: .failed)
             }
         } catch {
             log("[Error] Error processing file \(url.lastPathComponent): \(error)")
-            self.updateFileStatus(for: url, status: .failed)
+            await updateFileStatus(for: url, status: .failed)
         }
+        processingTasks[url] = nil
     }
 
-    // MARK: - Enhanced Identifier Extraction
-
-    private func extractISBN(from url: URL) throws -> String? {
+    private func extractISBN(from url: URL) async throws -> String? {
         switch url.pathExtension.lowercased() {
         case "pdf":
-            return try extractISBNFromPDF(url: url)
+            return try await extractISBNFromPDF(url: url)
         case "epub":
-            return try extractISBNFromEPUB(url: url)
+            return try await extractISBNFromEPUB(url: url)
         default:
             return nil
         }
     }
 
-    private func extractISBNFromPDF(url: URL) throws -> String? {
+    private func extractISBNFromPDF(url: URL) async throws -> String? {
         log("[ExtractISBNFromPDF] Extracting ISBN from PDF: \(url.lastPathComponent)")
         guard let pdfDocument = PDFDocument(url: url) else {
             log("[ExtractISBNFromPDF] Failed to open PDF document.")
@@ -190,7 +187,6 @@ class FileMonitor: ObservableObject {
 
         var potentialISBNs = Set<String>()
 
-        // Extract ISBN from document metadata
         if let metadata = pdfDocument.documentAttributes {
             for key in ["Keywords", "Title", "Subject", "Author", "Producer", "Creator"] {
                 if let value = metadata[key] as? String {
@@ -200,7 +196,6 @@ class FileMonitor: ObservableObject {
             }
         }
 
-        // Extract ISBN from the first few pages
         let maxPagesToSearch = min(pdfDocument.pageCount, 10)
         for pageIndex in 0..<maxPagesToSearch {
             if let page = pdfDocument.page(at: pageIndex),
@@ -210,18 +205,6 @@ class FileMonitor: ObservableObject {
             }
         }
 
-        // If no ISBNs found yet, scan the entire document (can be time-consuming)
-        if potentialISBNs.isEmpty {
-            for pageIndex in maxPagesToSearch..<pdfDocument.pageCount {
-                if let page = pdfDocument.page(at: pageIndex),
-                   let pageContent = page.string {
-                    let isbns = extractISBNsFromString(pageContent)
-                    potentialISBNs.formUnion(isbns)
-                }
-            }
-        }
-
-        // Validate ISBNs
         for isbn in potentialISBNs {
             if isValidISBN(isbn) {
                 log("[ExtractISBNFromPDF] Valid ISBN found: \(isbn)")
@@ -233,13 +216,12 @@ class FileMonitor: ObservableObject {
         return nil
     }
 
-    private func extractISBNFromEPUB(url: URL) throws -> String? {
+    private func extractISBNFromEPUB(url: URL) async throws -> String? {
         log("[ExtractISBNFromEPUB] Extracting ISBN from EPUB: \(url.lastPathComponent)")
         do {
             let archive = try Archive(url: url, accessMode: .read)
             var potentialISBNs = Set<String>()
 
-            // Look for OPF and HTML files in EPUB
             for entry in archive {
                 if entry.path.hasSuffix(".opf") || entry.path.hasSuffix(".html") || entry.path.hasSuffix(".htm") || entry.path.hasSuffix(".xhtml") {
                     var fileData = Data()
@@ -253,7 +235,6 @@ class FileMonitor: ObservableObject {
                 }
             }
 
-            // Validate ISBNs
             for isbn in potentialISBNs {
                 if isValidISBN(isbn) {
                     log("[ExtractISBNFromEPUB] Valid ISBN found: \(isbn)")
@@ -272,10 +253,8 @@ class FileMonitor: ObservableObject {
     private func extractISBNsFromString(_ string: String) -> Set<String> {
         var potentialISBNs = Set<String>()
 
-        // Regular expressions for ISBN-10 and ISBN-13
         let patterns = [
-            #"\bISBN[- ]?(1[03])?:?\s*([0-9]{1,5}[\- ]?[0-9]+[\- ]?[0-9]+[\- ]?[0-9Xx])\b"#,  // Matches ISBN with or without ISBN-10 or ISBN-13 prefix
-            #"\b(97(8|9))?\d{9}(\d|X)\b"#  // Matches 13-digit ISBNs
+            #"\b(?:ISBN(?:-1[03])?:?\s*)?((?:97[89][\-\s]?)?[0-9][0-9\-\s]{9,}[0-9Xx])\b"#
         ]
 
         for pattern in patterns {
@@ -283,7 +262,7 @@ class FileMonitor: ObservableObject {
                 let nsString = string as NSString
                 let results = regex.matches(in: string, options: [], range: NSRange(location: 0, length: nsString.length))
                 for match in results {
-                    let isbnCandidate = nsString.substring(with: match.range)
+                    let isbnCandidate = nsString.substring(with: match.range(at: 1))
                     let cleanedISBN = cleanISBNString(isbnCandidate)
                     potentialISBNs.insert(cleanedISBN)
                 }
@@ -294,7 +273,6 @@ class FileMonitor: ObservableObject {
     }
 
     private func cleanISBNString(_ isbn: String) -> String {
-        // Remove any non-alphanumeric characters
         let allowedCharacters = CharacterSet.alphanumerics
         let cleanedISBN = isbn.unicodeScalars.filter { allowedCharacters.contains($0) }.map { Character($0) }
         return String(cleanedISBN).uppercased()
@@ -358,19 +336,17 @@ class FileMonitor: ObservableObject {
             return nil
         }
 
-        // Check document attributes for Title
         if let metadata = pdfDocument.documentAttributes,
            let title = metadata["Title"] as? String, !title.isEmpty {
             log("[ExtractTitleFromPDF] Found title in metadata: \(title)")
             return title
         }
 
-        // Fallback to first page content
         if let firstPage = pdfDocument.page(at: 0),
            let pageContent = firstPage.string {
             let lines = pageContent.components(separatedBy: "\n")
             for line in lines {
-                if line.count > 5 && line.count < 100 { // Heuristic for title length
+                if line.count > 5 && line.count < 100 {
                     log("[ExtractTitleFromPDF] Found title in content: \(line)")
                     return line.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
@@ -422,50 +398,37 @@ class FileMonitor: ObservableObject {
         return nil
     }
 
-    // MARK: - Move and Rename File with Identifiers
+    private func moveAndRenameFile(at url: URL, withIdentifiers identifiers: [String: String]) async -> Bool {
+        guard let (fullName, metadata) = await fetchBookInfo(identifiers: identifiers) else {
+            log("[MoveAndRenameFile] Failed to fetch book info for identifiers: \(identifiers)")
+            return false
+        }
 
-    private func moveAndRenameFile(at url: URL, withIdentifiers identifiers: [String: String], completion: @escaping (Bool) -> Void) {
-        fetchBookInfo(identifiers: identifiers) { [weak self] fullName, metadata in
-            guard let self = self else { return }
-            guard let fullName = fullName else {
-                self.log("[MoveAndRenameFile] Failed to fetch book info for identifiers: \(identifiers)")
-                completion(false)
-                return
+        let sanitizedName = sanitizeFileName(fullName)
+        let destinationURL = booksFolderURL.appendingPathComponent("\(sanitizedName).\(url.pathExtension)")
+
+        do {
+            if fileManager.fileExists(atPath: destinationURL.path) {
+                try fileManager.removeItem(at: destinationURL)
+            }
+            try fileManager.moveItem(at: url, to: destinationURL)
+            log("[MoveAndRenameFile] Moved and renamed file to \(destinationURL.path)")
+
+            updateMetadata(for: destinationURL, with: metadata)
+
+            if let index = detectedFiles.firstIndex(where: { $0.url == url }) {
+                detectedFiles[index].newFileName = sanitizedName + "." + url.pathExtension
             }
 
-            let sanitizedName = self.sanitizeFileName(fullName)
-            let destinationURL = self.booksFolderURL
-                .appendingPathComponent("\(sanitizedName).\(url.pathExtension)")
-
-            do {
-                if self.fileManager.fileExists(atPath: destinationURL.path) {
-                    try self.fileManager.removeItem(at: destinationURL)
-                }
-                try self.fileManager.moveItem(at: url, to: destinationURL)
-                self.log("[MoveAndRenameFile] Moved and renamed file to \(destinationURL.path)")
-
-                // Update metadata
-                self.updateMetadata(for: destinationURL, with: metadata)
-
-                // Update UI
-                DispatchQueue.main.async {
-                    if let index = self.detectedFiles.firstIndex(where: { $0.url == url }) {
-                        self.detectedFiles[index].newFileName = sanitizedName + "." + url.pathExtension
-                    }
-                }
-
-                completion(true)
-            } catch {
-                self.log("[Error] Error moving and renaming file: \(error)")
-                completion(false)
-            }
+            return true
+        } catch {
+            log("[Error] Error moving and renaming file: \(error)")
+            return false
         }
     }
 
-    // MARK: - Fetch Book Info with Retry Mechanism
-
-    private func fetchBookInfo(identifiers: [String: String], completion: @escaping (String?, [String: Any]?) -> Void) {
-        let apiKey = "" // Add your Google Books API key if you have one
+    private func fetchBookInfo(identifiers: [String: String]) async -> (String, [String: Any])? {
+        let apiKey = ""
 
         var query = ""
         if let isbn = identifiers["isbn"] {
@@ -473,72 +436,53 @@ class FileMonitor: ObservableObject {
         } else if let title = identifiers["title"] {
             query = "intitle:\(title)"
         } else {
-            completion(nil, nil)
-            return
+            return nil
         }
 
         let urlString = "https://www.googleapis.com/books/v1/volumes?q=\(query)&key=\(apiKey)"
         guard let encodedURLString = urlString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: encodedURLString) else {
             log("[FetchBookInfo] Invalid URL for query: \(query)")
-            completion(nil, nil)
-            return
+            return nil
         }
 
         let urlSession = URLSession(configuration: .ephemeral)
-        var attempts = 0
         let maxAttempts = 3
+        var attempts = 0
+        var delay: UInt64 = 1_000_000_000
 
-        func makeRequest() {
+        while attempts < maxAttempts {
             attempts += 1
-            let task = urlSession.dataTask(with: url) { [weak self] data, response, error in
-                guard let self = self else { return }
+            do {
+                let (data, _) = try await urlSession.data(from: url)
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let items = json["items"] as? [[String: Any]],
+                   let volumeInfo = items.first?["volumeInfo"] as? [String: Any],
+                   let title = volumeInfo["title"] as? String {
 
-                if let error = error {
-                    self.log("[FetchBookInfo] Error fetching book info: \(error)")
-                    if attempts < maxAttempts {
-                        self.log("[FetchBookInfo] Retrying... (\(attempts)/\(maxAttempts))")
-                        makeRequest()
-                    } else {
-                        completion(nil, nil)
-                    }
-                    return
+                    let authors = volumeInfo["authors"] as? [String] ?? ["Unknown Author"]
+                    let authorsString = authors.joined(separator: ", ")
+                    let fullName = "\(title) - \(authorsString)"
+
+                    log("[FetchBookInfo] Fetched book info: \(fullName)")
+                    return (fullName, volumeInfo)
+                } else {
+                    log("[FetchBookInfo] Book info not found in response.")
+                    return nil
                 }
-
-                guard let data = data else {
-                    self.log("[FetchBookInfo] No data received from book info request.")
-                    completion(nil, nil)
-                    return
-                }
-
-                do {
-                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let items = json["items"] as? [[String: Any]],
-                       let volumeInfo = items.first?["volumeInfo"] as? [String: Any],
-                       let title = volumeInfo["title"] as? String {
-
-                        let authors = volumeInfo["authors"] as? [String] ?? ["Unknown Author"]
-                        let authorsString = authors.joined(separator: ", ")
-                        let fullName = "\(title) - \(authorsString)"
-
-                        self.log("[FetchBookInfo] Fetched book info: \(fullName)")
-                        completion(fullName, volumeInfo)
-                    } else {
-                        self.log("[FetchBookInfo] Book info not found in response.")
-                        completion(nil, nil)
-                    }
-                } catch {
-                    self.log("[FetchBookInfo] Error parsing JSON: \(error)")
-                    completion(nil, nil)
+            } catch {
+                log("[FetchBookInfo] Error fetching book info: \(error)")
+                if attempts < maxAttempts {
+                    log("[FetchBookInfo] Retrying in \(delay / 1_000_000_000) seconds... (\(attempts)/\(maxAttempts))")
+                    try? await Task.sleep(nanoseconds: delay)
+                    delay *= 2
+                } else {
+                    return nil
                 }
             }
-            task.resume()
         }
-
-        makeRequest()
+        return nil
     }
-
-    // MARK: - Update Metadata
 
     private func updateMetadata(for url: URL, with metadata: [String: Any]?) {
         guard let metadata = metadata else { return }
@@ -566,36 +510,29 @@ class FileMonitor: ObservableObject {
         attributes[PDFDocumentAttribute.subjectAttribute] = (metadata["categories"] as? [String])?.joined(separator: ", ")
         pdfDocument.documentAttributes = attributes
 
-        // Save the updated PDF
-        pdfDocument.write(to: url)
-        log("[UpdatePDFMetadata] Updated PDF metadata for \(url.lastPathComponent)")
+        let success = pdfDocument.write(to: url)
+        if success {
+            log("[UpdatePDFMetadata] Updated PDF metadata for \(url.lastPathComponent)")
+        } else {
+            log("[UpdatePDFMetadata] Failed to write updated PDF.")
+        }
     }
 
     private func updateEPUBMetadata(for url: URL, with metadata: [String: Any]) {
-        // Updating EPUB metadata is complex; a full implementation would require parsing and updating OPF files.
-        // For brevity, we'll log that this is not implemented fully.
         log("[UpdateEPUBMetadata] Updating EPUB metadata is not fully implemented.")
     }
 
-    // MARK: - Update File Status
-
-    private func updateFileStatus(for url: URL, status: FileStatus) {
-        DispatchQueue.main.async {
-            if let index = self.detectedFiles.firstIndex(where: { $0.url == url }) {
-                self.detectedFiles[index].status = status
-            }
+    private func updateFileStatus(for url: URL, status: FileStatus) async {
+        if let index = detectedFiles.firstIndex(where: { $0.url == url }) {
+            detectedFiles[index].status = status
         }
     }
 
-    private func updateFileStatus(for id: UUID, status: FileStatus) {
-        DispatchQueue.main.async {
-            if let index = self.detectedFiles.firstIndex(where: { $0.id == id }) {
-                self.detectedFiles[index].status = status
-            }
+    private func updateFileStatus(for id: UUID, status: FileStatus) async {
+        if let index = detectedFiles.firstIndex(where: { $0.id == id }) {
+            detectedFiles[index].status = status
         }
     }
-
-    // MARK: - Manual ISBN Entry
 
     func promptForISBN(file: DetectedFile) {
         DispatchQueue.main.async {
@@ -614,27 +551,28 @@ class FileMonitor: ObservableObject {
                 let isbnInput = inputField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
                 let cleanedISBN = self.cleanISBNString(isbnInput)
                 if self.isValidISBN(cleanedISBN) {
-                    self.updateFileStatus(for: file.url, status: .processing)
-                    self.processFileWithManualISBN(file: file, isbn: cleanedISBN)
+                    Task {
+                        await self.updateFileStatus(for: file.url, status: .processing)
+                        await self.processFileWithManualISBN(file: file, isbn: cleanedISBN)
+                    }
                 } else {
                     self.log("[ManualISBNEntry] Invalid ISBN entered: \(isbnInput)")
-                    self.updateFileStatus(for: file.url, status: .failed)
+                    Task {
+                        await self.updateFileStatus(for: file.url, status: .failed)
+                    }
                 }
             }
         }
     }
 
-    private func processFileWithManualISBN(file: DetectedFile, isbn: String) {
-        self.moveAndRenameFile(at: file.url, withIdentifiers: ["isbn": isbn]) { success in
-            if success {
-                self.updateFileStatus(for: file.url, status: .processed)
-            } else {
-                self.updateFileStatus(for: file.url, status: .failed)
-            }
+    private func processFileWithManualISBN(file: DetectedFile, isbn: String) async {
+        let success = await moveAndRenameFile(at: file.url, withIdentifiers: ["isbn": isbn])
+        if success {
+            await updateFileStatus(for: file.url, status: .processed)
+        } else {
+            await updateFileStatus(for: file.url, status: .failed)
         }
     }
-
-    // MARK: - Utility Methods
 
     private func sanitizeFileName(_ fileName: String) -> String {
         let invalidCharacters = CharacterSet(charactersIn: "/\\:?%*|\"<>")
@@ -642,11 +580,11 @@ class FileMonitor: ObservableObject {
     }
 
     private func log(_ message: String) {
-        Logger.shared.log(message)
+        Task {
+            await Logger.shared.log(message)
+        }
     }
 }
-
-// MARK: - Supporting Types
 
 enum FileStatus {
     case pending

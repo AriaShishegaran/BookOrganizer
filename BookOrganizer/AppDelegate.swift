@@ -2,11 +2,11 @@ import Cocoa
 import SwiftUI
 import ServiceManagement
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var fileMonitor = FileMonitor()
-    var eventMonitor: EventMonitor?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Set up the status bar item
@@ -28,14 +28,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Auto-launch at login
         enableLaunchAtLogin()
-
-        // Set up event monitor to close popover when clicking outside
-        eventMonitor = EventMonitor(mask: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            if let strongSelf = self, strongSelf.popover.isShown {
-                strongSelf.closePopover(sender: nil)
-            }
-        }
-        eventMonitor?.start()
     }
 
     @objc func togglePopover(_ sender: AnyObject?) {
@@ -64,39 +56,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         fileMonitor.stopMonitoring()
-        eventMonitor?.stop()
     }
 
     // Enable auto-launch at login
     func enableLaunchAtLogin() {
         do {
             try SMAppService.mainApp.register()
-            Logger.shared.log("[AutoLaunch] Successfully registered for launch at login.")
+            Task {
+                await Logger.shared.log("[AutoLaunch] Successfully registered for launch at login.")
+            }
         } catch {
-            Logger.shared.log("[AutoLaunch] Failed to register for launch at login: \(error)")
-        }
-    }
-}
-
-// EventMonitor class to monitor clicks outside the popover
-class EventMonitor {
-    private var monitor: Any?
-    private let mask: NSEvent.EventTypeMask
-    private let handler: (NSEvent?) -> Void
-
-    init(mask: NSEvent.EventTypeMask, handler: @escaping (NSEvent?) -> Void) {
-        self.mask = mask
-        self.handler = handler
-    }
-
-    func start() {
-        monitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: handler)
-    }
-
-    func stop() {
-        if monitor != nil {
-            NSEvent.removeMonitor(monitor!)
-            monitor = nil
+            Task {
+                await Logger.shared.log("[AutoLaunch] Failed to register for launch at login: \(error)")
+            }
         }
     }
 }
